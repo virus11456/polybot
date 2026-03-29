@@ -1,0 +1,63 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://polybot:polybot@db:5432/polybot
+      - REDIS_URL=redis://redis:6379/0
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - FRED_API_KEY=${FRED_API_KEY}
+      - SCAN_INTERVAL_SEC=${SCAN_INTERVAL_SEC:-30}
+      - MIN_PROFIT_PCT=${MIN_PROFIT_PCT:-0.005}
+      - MIN_LIQUIDITY_USD=${MIN_LIQUIDITY_USD:-1000}
+      - MAX_POSITION_USD=${MAX_POSITION_USD:-5000}
+      - DEFAULT_MODE=${DEFAULT_MODE:-manual}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  worker:
+    build: .
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://polybot:polybot@db:5432/polybot
+      - REDIS_URL=redis://redis:6379/0
+      - FRED_API_KEY=${FRED_API_KEY}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A app.tasks worker --loglevel=info
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: polybot
+      POSTGRES_PASSWORD: polybot
+      POSTGRES_DB: polybot
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polybot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
