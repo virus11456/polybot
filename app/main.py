@@ -6,6 +6,7 @@ Integrates scanner, Telegram bot, and exposes REST API.
 import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, Query, Request
 from fastapi.responses import JSONResponse
@@ -16,8 +17,6 @@ from app.database import get_db, engine, Base
 from app.models import Market, RoanSignal, RoanPerformance  # noqa: F401 — ensures models registered
 
 logger = logging.getLogger(__name__)
-
-app = FastAPI(title="Roan Arbitrage Machine", version="1.0.0")
 
 # ─── Lazy-initialised singletons ─────────────────────────────────────────────
 
@@ -51,11 +50,11 @@ def _get_bot():
 
 # ─── Lifecycle ────────────────────────────────────────────────────────────────
 
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     logger.info("Starting up Roan Arbitrage Machine...")
 
-    # Start scanner continuous scan in background
     scanner = _get_scanner()
     if scanner:
         asyncio.create_task(scanner.continuous_scan())
@@ -63,7 +62,6 @@ async def startup():
     else:
         logger.warning("Scanner unavailable — skipping.")
 
-    # Initialise Telegram bot and register webhook
     bot = _get_bot()
     if bot:
         logger.info("Telegram bot initialised.")
@@ -73,9 +71,18 @@ async def startup():
         else:
             logger.warning(
                 "TELEGRAM_WEBHOOK_URL not set — webhook not registered. "
-                "Commands from users will not be received. "
-                "Set TELEGRAM_WEBHOOK_URL=https://<your-railway-domain>/api/telegram/webhook"
+                "Commands from users will not be received."
             )
+
+    yield
+
+    # Shutdown
+    bot = _get_bot()
+    if bot:
+        await bot.close()
+        logger.info("Telegram bot session closed.")
+    await engine.dispose()
+    logger.info("Database engine disposed.")
 
 
 async def _register_webhook(bot, webhook_url: str):
@@ -92,15 +99,7 @@ async def _register_webhook(bot, webhook_url: str):
         logger.error("Telegram webhook 設定失敗，請手動呼叫 POST /api/telegram/setup-webhook")
 
 
-@app.on_event("shutdown")
-async def shutdown():
-    # Close the Telegram bot's aiohttp session cleanly
-    bot = _get_bot()
-    if bot:
-        await bot.close()
-        logger.info("Telegram bot session closed.")
-    await engine.dispose()
-    logger.info("Database engine disposed.")
+app = FastAPI(title="Roan Arbitrage Machine", version="1.0.0", lifespan=lifespan)
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -222,5 +221,3 @@ async def get_markets():
         return {"ok": False, "error": "scanner not available", "markets": []}
     summary = scanner.get_last_markets_summary()
     return {"ok": True, **summary}
-
-
