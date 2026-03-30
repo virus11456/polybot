@@ -315,6 +315,71 @@ class RoanTelegramBot:
         await self.send_message(text)
         logger.info(f"每日報告已發送（{date_str}）")
 
+    # ─── 最新信號查詢 ─────────────────────────────────────────────────────────
+
+    async def send_recent_signals(self, chat_id: Optional[str] = None, limit: int = 10) -> None:
+        """
+        發送最新套利信號清單（從資料庫取最近 N 筆）。
+        """
+        target = chat_id or self.chat_id
+
+        try:
+            from app.database import AsyncSessionLocal
+            from sqlalchemy import text
+
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    text("""
+                        SELECT rs.signal_type, rs.profit_pct, rs.confidence,
+                               rs.suggested_position, rs.status, rs.created_at,
+                               m.title, m.yes_price, m.category
+                        FROM roan_signals rs
+                        LEFT JOIN markets m ON m.id = rs.market_id
+                        ORDER BY rs.created_at DESC
+                        LIMIT :limit
+                    """),
+                    {"limit": limit}
+                )
+                rows = result.mappings().all()
+
+        except Exception as e:
+            logger.error(f"取信號數據失敗：{e}")
+            await self.send_message(f"⚠️ 無法取得信號資料：{e}", chat_id=target)
+            return
+
+        if not rows:
+            await self.send_message(
+                "🔍 <b>最新套利信號</b>\n\n目前尚無信號紀錄。\n掃描器持續運行中，偵測到信號將自動推送。",
+                chat_id=target
+            )
+            return
+
+        lines = [f"🔍 <b>最新 {len(rows)} 筆套利信號</b>", "━━━━━━━━━━━━━━━━━━━━"]
+
+        for row in rows:
+            emoji = "🔵" if row["signal_type"] == "logic_arb" else "🟣"
+            type_label = "邏輯依賴" if row["signal_type"] == "logic_arb" else "多條件組合"
+            title = (row["title"] or "（未知市場）")[:50]
+            profit = float(row["profit_pct"] or 0)
+            conf = float(row["confidence"] or 0)
+            status = row["status"] or "pending"
+            created = row["created_at"]
+            time_str = created.strftime("%m/%d %H:%M") if created else ""
+
+            lines.append(
+                f"\n{emoji} {type_label} | {time_str}\n"
+                f"市場：{title}\n"
+                f"獲利：{profit:.2%}  置信度：{conf:.0%}  狀態：{status}"
+            )
+
+        lines.append("\n━━━━━━━━━━━━━━━━━━━━")
+        lines.append("使用 /report 查看今日績效總覽。")
+
+        full_text = "\n".join(lines)
+        chunk_size = 3800
+        for i in range(0, len(full_text), chunk_size):
+            await self.send_message(full_text[i:i + chunk_size], chat_id=target)
+
     # ─── 市場清單 ────────────────────────────────────────────────────────────
 
     async def send_market_list(self, chat_id: Optional[str] = None) -> None:
@@ -415,6 +480,9 @@ class RoanTelegramBot:
         elif text.startswith("/markets"):
             await self.send_category_selector(chat_id=chat_id)
 
+        elif text.startswith("/signals"):
+            await self.send_recent_signals(chat_id=chat_id)
+
         elif text.startswith("/report"):
             await self.send_daily_report()
 
@@ -429,6 +497,7 @@ class RoanTelegramBot:
                 "📋 <b>指令：</b>\n"
                 "/marketlist — 列出目前鎖定掃描中的所有市場（按類別）\n"
                 "/markets — 按類別篩選要接收的通知\n"
+                "/signals — 查看最新 10 筆套利信號\n"
                 "/report — 查看今日績效報告\n\n"
                 "掃描頻率：每 60 秒一次（可透過 SCAN_INTERVAL_SECONDS 環境變數調整）",
                 chat_id=chat_id
