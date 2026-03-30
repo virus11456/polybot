@@ -336,15 +336,19 @@ class RoanScanner:
             logger.error(f"儲存信號失敗：{e}")
 
     async def _send_telegram_signals(self, signals: List[dict]):
-        """發送 Telegram 通知（透過 RoanTelegramBot）。"""
+        """發送 Telegram 通知（透過 RoanTelegramBot singleton）。"""
         token = os.getenv("TELEGRAM_TOKEN")
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
         if not token or not chat_id:
             return
 
         try:
-            from app.telegram.roan_bot import RoanTelegramBot
-            bot = RoanTelegramBot(token=token, chat_id=chat_id)
+            # 重用 main.py 的 singleton bot，避免每次建立新 session 造成資源洩漏
+            import app.main as _main
+            bot = _main._get_bot()
+            if bot is None:
+                logger.warning("Telegram bot singleton not available, skipping signals")
+                return
             for sig in signals[:5]:  # 每次最多發 5 個信號避免刷屏
                 await bot.send_signal(sig)
         except Exception as e:

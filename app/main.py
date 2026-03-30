@@ -71,6 +71,11 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
+    # Close the Telegram bot's aiohttp session cleanly
+    bot = _get_bot()
+    if bot:
+        await bot.close()
+        logger.info("Telegram bot session closed.")
     await engine.dispose()
     logger.info("Database engine disposed.")
 
@@ -80,9 +85,12 @@ async def shutdown():
 @app.get("/health")
 async def health():
     scanner = _get_scanner()
+    bot = _get_bot()
     return {
         "status": "running",
         "scanner": "active" if scanner else "unavailable",
+        "telegram_bot": "active" if bot else "unavailable",
+        "last_scan": scanner._last_scan_time if scanner else None,
     }
 
 

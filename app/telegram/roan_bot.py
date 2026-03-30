@@ -291,7 +291,6 @@ class RoanTelegramBot:
         """
         target = chat_id or self.chat_id
         try:
-            from app.core.roan_scanner import RoanScanner
             import app.main as _main
             scanner = _main._get_scanner()
         except Exception:
