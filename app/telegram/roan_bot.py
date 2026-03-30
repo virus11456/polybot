@@ -58,6 +58,39 @@ class RoanTelegramBot:
         if self._http and not self._http.closed:
             await self._http.close()
 
+    async def set_webhook(self, webhook_url: str) -> bool:
+        """向 Telegram 注冊 webhook URL，讓 Telegram 將更新推送到本服務。"""
+        http = await self._get_http()
+        try:
+            async with http.post(
+                f"{self._base_url}/setWebhook",
+                json={
+                    "url": webhook_url,
+                    "allowed_updates": ["message", "callback_query"],
+                    "drop_pending_updates": False,
+                }
+            ) as resp:
+                data = await resp.json()
+                if data.get("ok"):
+                    logger.info(f"Telegram webhook 已設定：{webhook_url}")
+                    return True
+                else:
+                    logger.error(f"Telegram webhook 設定失敗：{data}")
+                    return False
+        except Exception as e:
+            logger.error(f"Telegram setWebhook HTTP 錯誤：{e}")
+            return False
+
+    async def get_webhook_info(self) -> dict:
+        """取得目前 webhook 狀態。"""
+        http = await self._get_http()
+        try:
+            async with http.get(f"{self._base_url}/getWebhookInfo") as resp:
+                return await resp.json()
+        except Exception as e:
+            logger.error(f"getWebhookInfo 失敗：{e}")
+            return {}
+
     # ─── 發送訊息 ────────────────────────────────────────────────────────────
 
     async def send_message(self, text: str, chat_id: Optional[str] = None,

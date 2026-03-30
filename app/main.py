@@ -63,10 +63,33 @@ async def startup():
     else:
         logger.warning("Scanner unavailable — skipping.")
 
-    # Initialise Telegram bot if configured
+    # Initialise Telegram bot and register webhook
     bot = _get_bot()
     if bot:
         logger.info("Telegram bot initialised.")
+        webhook_url = os.getenv("TELEGRAM_WEBHOOK_URL")
+        if webhook_url:
+            asyncio.create_task(_register_webhook(bot, webhook_url))
+        else:
+            logger.warning(
+                "TELEGRAM_WEBHOOK_URL not set — webhook not registered. "
+                "Commands from users will not be received. "
+                "Set TELEGRAM_WEBHOOK_URL=https://<your-railway-domain>/api/telegram/webhook"
+            )
+
+
+async def _register_webhook(bot, webhook_url: str):
+    """在啟動後台注冊 Telegram webhook（避免阻塞啟動）。"""
+    info = await bot.get_webhook_info()
+    current_url = info.get("result", {}).get("url", "")
+    if current_url == webhook_url:
+        logger.info(f"Telegram webhook 已是最新，無需重新設定：{webhook_url}")
+        return
+    ok = await bot.set_webhook(webhook_url)
+    if ok:
+        logger.info(f"Telegram webhook 設定成功：{webhook_url}")
+    else:
+        logger.error("Telegram webhook 設定失敗，請手動呼叫 POST /api/telegram/setup-webhook")
 
 
 @app.on_event("shutdown")
@@ -130,7 +153,6 @@ async def get_performance(db: AsyncSession = Depends(get_db)):
 async def telegram_webhook(request: Request):
     """
     Telegram webhook 端點：接收 Telegram 更新事件並路由至 bot。
-    需在 Telegram 設定 webhook URL 指向此端點。
     """
     bot = _get_bot()
     if not bot:
@@ -143,6 +165,29 @@ async def telegram_webhook(request: Request):
     except Exception as e:
         logger.error(f"Webhook 處理失敗：{e}")
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/api/telegram/setup-webhook")
+async def setup_webhook():
+    """手動（重新）向 Telegram 注冊 webhook URL。"""
+    bot = _get_bot()
+    if not bot:
+        return {"ok": False, "error": "bot not configured"}
+    webhook_url = os.getenv("TELEGRAM_WEBHOOK_URL")
+    if not webhook_url:
+        return {"ok": False, "error": "TELEGRAM_WEBHOOK_URL env var not set"}
+    ok = await bot.set_webhook(webhook_url)
+    info = await bot.get_webhook_info()
+    return {"ok": ok, "webhook_info": info}
+
+
+@app.get("/api/telegram/webhook-info")
+async def get_webhook_info():
+    """查詢目前 Telegram webhook 狀態。"""
+    bot = _get_bot()
+    if not bot:
+        return {"ok": False, "error": "bot not configured"}
+    return await bot.get_webhook_info()
 
 
 @app.post("/api/report/daily")
