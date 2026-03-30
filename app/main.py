@@ -160,3 +160,14 @@ async def trigger_scan():
         logger.error(f"手動掃描失敗：{e}")
         return {"ok": False, "error": str(e)}
 
+
+@app.get("/api/markets")
+async def get_markets():
+    """回傳最近一次掃描到的市場清單（按類別分組）。"""
+    scanner = _get_scanner()
+    if not scanner:
+        return {"ok": False, "error": "scanner not available", "markets": []}
+    summary = scanner.get_last_markets_summary()
+    return {"ok": True, **summary}
+
+

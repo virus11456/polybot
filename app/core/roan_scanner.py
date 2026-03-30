@@ -70,7 +70,11 @@ class RoanScanner:
             db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
 
         self._client = PolymarketClient(db_url=db_url if db_url else None)
-        self._scan_interval = int(os.getenv("SCAN_INTERVAL_SECONDS", "300"))  # 預設 5 分鐘
+        self._scan_interval = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))  # 預設 1 分鐘
+
+        # 快取最新掃描到的市場列表（供 TG /marketlist 查詢）
+        self._last_markets: List[dict] = []
+        self._last_scan_time: Optional[str] = None
 
     async def continuous_scan(self):
         """持續掃描循環（在後台 task 中執行）。"""
@@ -92,6 +96,11 @@ class RoanScanner:
         # 取得最新市場資料
         markets = await self._client.get_active_markets()
         logger.info(f"取得 {len(markets)} 個市場")
+
+        # 快取最新市場供 TG 查詢
+        self._last_markets = markets
+        from datetime import datetime as _dt
+        self._last_scan_time = _dt.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
         all_signals = []
 
@@ -252,6 +261,28 @@ class RoanScanner:
         return signals
 
     # ─── 工具方法 ───────────────────────────────────────────────────────────────
+
+    def get_last_markets_summary(self) -> dict:
+        """回傳最近一次掃描的市場摘要（供 Telegram /marketlist 指令使用）。"""
+        by_category: Dict[str, List[dict]] = {}
+        for mkt in self._last_markets:
+            cat = mkt.get("category", "other")
+            by_category.setdefault(cat, []).append(mkt)
+        return {
+            "scan_time": self._last_scan_time,
+            "total": len(self._last_markets),
+            "by_category": {
+                cat: [
+                    {
+                        "title": m.get("title", "")[:80],
+                        "yes_price": m.get("yes_price"),
+                        "liquidity": m.get("liquidity", 0),
+                    }
+                    for m in sorted(mkts, key=lambda m: m.get("liquidity", 0), reverse=True)[:5]
+                ]
+                for cat, mkts in by_category.items()
+            },
+        }
 
     def _filter_markets_by_keywords(self, markets: List[dict], keywords: List[str]) -> List[dict]:
         """依關鍵字過濾市場（標題匹配）。"""

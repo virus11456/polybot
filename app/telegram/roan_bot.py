@@ -282,12 +282,75 @@ class RoanTelegramBot:
         await self.send_message(text)
         logger.info(f"每日報告已發送（{date_str}）")
 
+    # ─── 市場清單 ────────────────────────────────────────────────────────────
+
+    async def send_market_list(self, chat_id: Optional[str] = None) -> None:
+        """
+        發送目前掃描中的市場清單（從 scanner 取最新快取）。
+        按類別列出，每類最多顯示 5 個流動性最高的市場。
+        """
+        target = chat_id or self.chat_id
+        try:
+            from app.core.roan_scanner import RoanScanner
+            import app.main as _main
+            scanner = _main._get_scanner()
+        except Exception:
+            scanner = None
+
+        if not scanner:
+            await self.send_message("⚠️ 掃描器未啟動，無法取得市場清單。", chat_id=target)
+            return
+
+        summary = scanner.get_last_markets_summary()
+        scan_time = summary.get("scan_time") or "尚未掃描"
+        total = summary.get("total", 0)
+        by_category = summary.get("by_category", {})
+
+        CATEGORY_LABELS = {
+            "macro": "📈 總體經濟",
+            "weather": "🌦️ 天氣",
+            "politics": "🗳️ 政治",
+            "earnings": "💰 財報",
+            "regulatory": "⚖️ 監管",
+            "geopolitical": "🌍 地緣政治",
+            "other": "🔹 其他",
+        }
+
+        lines = [
+            f"🗂 <b>目前掃描中的市場</b>",
+            f"更新時間：{scan_time}　共 {total} 個市場",
+            "━━━━━━━━━━━━━━━━━━━━",
+        ]
+
+        if not by_category:
+            lines.append("（尚無市場資料，請稍後再試）")
+        else:
+            for cat, mkts in sorted(by_category.items()):
+                label = CATEGORY_LABELS.get(cat, cat)
+                lines.append(f"\n{label}（{len(mkts)} 個）")
+                for m in mkts:
+                    yes = m.get("yes_price")
+                    liq = m.get("liquidity", 0)
+                    yes_str = f"{yes:.0%}" if yes is not None else "N/A"
+                    liq_str = f"${liq:,.0f}"
+                    lines.append(f"  • {m['title'][:60]}")
+                    lines.append(f"    YES={yes_str}  流動性={liq_str}")
+
+        lines.append("\n━━━━━━━━━━━━━━━━━━━━")
+        lines.append("使用 /markets 可按類別篩選通知。")
+
+        # Split into chunks to avoid Telegram 4096-char limit
+        full_text = "\n".join(lines)
+        chunk_size = 3800
+        for i in range(0, len(full_text), chunk_size):
+            await self.send_message(full_text[i:i + chunk_size], chat_id=target)
+
     # ─── 指令處理 ─────────────────────────────────────────────────────────────
 
     async def handle_update(self, update: dict) -> None:
         """
         處理 Telegram webhook 更新事件。
-        支援指令：/start, /markets, /signals, /report, /help
+        支援指令：/start, /markets, /marketlist, /signals, /report, /help
         """
         message = update.get("message")
         callback_query = update.get("callback_query")
@@ -306,12 +369,16 @@ class RoanTelegramBot:
             await self.send_message(
                 "👋 <b>歡迎使用 Roan 套利機器！</b>\n\n"
                 "可用指令：\n"
+                "/marketlist — 列出目前掃描中的市場\n"
                 "/markets — 選擇關注的市場類別\n"
                 "/signals — 查看最新套利信號\n"
                 "/report — 取得今日報告\n"
                 "/help — 顯示說明",
                 chat_id=chat_id
             )
+
+        elif text.startswith("/marketlist"):
+            await self.send_market_list(chat_id=chat_id)
 
         elif text.startswith("/markets"):
             await self.send_category_selector(chat_id=chat_id)
@@ -327,6 +394,10 @@ class RoanTelegramBot:
                 "若觸發市場 YES 高但依賴市場 YES 偏低，則依賴市場被低估。\n\n"
                 "🟣 <b>多條件組合套利</b>：同類別多市場相關性修正，"
                 "若多個相關市場 YES 均偏高但聯合機率被低估，則存在組合套利機會。\n\n"
-                "使用 /markets 選擇關注類別，減少不相關通知。",
+                "📋 <b>指令：</b>\n"
+                "/marketlist — 列出目前鎖定掃描中的所有市場（按類別）\n"
+                "/markets — 按類別篩選要接收的通知\n"
+                "/report — 查看今日績效報告\n\n"
+                "掃描頻率：每 60 秒一次（可透過 SCAN_INTERVAL_SECONDS 環境變數調整）",
                 chat_id=chat_id
             )
