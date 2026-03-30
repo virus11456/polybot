@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 celery_app = Celery("roan", broker=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
 
+from celery.schedules import crontab
+
 celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
@@ -26,6 +28,11 @@ celery_app.conf.update(
         "cleanup-old-signals-daily": {
             "task": "app.tasks.cleanup_old_signals",
             "schedule": 86400.0,
+        },
+        "send-daily-report": {
+            # 每天 UTC 00:30 發送（台灣時間 08:30）
+            "task": "app.tasks.send_daily_report",
+            "schedule": crontab(hour=0, minute=30),
         },
     },
 )
@@ -133,3 +140,30 @@ def cleanup_old_signals(self):
     except Exception as exc:
         logger.error(f"cleanup_old_signals failed: {exc}")
         raise self.retry(exc=exc, countdown=600)
+
+
+@celery_app.task(name="app.tasks.send_daily_report", bind=True, max_retries=2)
+def send_daily_report(self):
+    """每日 UTC 00:30：透過 Telegram 發送績效報告。"""
+    import asyncio
+    import os
+
+    async def _run():
+        token = os.getenv("TELEGRAM_TOKEN")
+        chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        if not token or not chat_id:
+            logger.warning("Telegram 未設定，跳過每日報告")
+            return
+
+        from app.telegram.roan_bot import RoanTelegramBot
+        bot = RoanTelegramBot(token=token, chat_id=chat_id)
+        try:
+            await bot.send_daily_report()
+        finally:
+            await bot.close()
+
+    try:
+        asyncio.run(_run())
+    except Exception as exc:
+        logger.error(f"send_daily_report failed: {exc}")
+        raise self.retry(exc=exc, countdown=300)

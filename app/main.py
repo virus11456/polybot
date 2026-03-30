@@ -7,7 +7,8 @@ import asyncio
 import logging
 import os
 
-from fastapi import FastAPI, Depends, Query
+from fastapi import FastAPI, Depends, Query, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
@@ -115,3 +116,47 @@ async def get_performance(db: AsyncSession = Depends(get_db)):
     )
     rows = result.mappings().all()
     return [dict(row) for row in rows]
+
+
+@app.post("/api/telegram/webhook")
+async def telegram_webhook(request: Request):
+    """
+    Telegram webhook 端點：接收 Telegram 更新事件並路由至 bot。
+    需在 Telegram 設定 webhook URL 指向此端點。
+    """
+    bot = _get_bot()
+    if not bot:
+        return JSONResponse({"ok": False, "error": "bot not configured"}, status_code=503)
+
+    try:
+        update = await request.json()
+        await bot.handle_update(update)
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Webhook 處理失敗：{e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/api/report/daily")
+async def trigger_daily_report():
+    """手動觸發每日報告（測試用）。"""
+    bot = _get_bot()
+    if not bot:
+        return {"ok": False, "error": "bot not configured"}
+    await bot.send_daily_report()
+    return {"ok": True, "message": "Daily report sent"}
+
+
+@app.post("/api/scan/trigger")
+async def trigger_scan():
+    """手動觸發一次掃描週期（測試用）。"""
+    scanner = _get_scanner()
+    if not scanner:
+        return {"ok": False, "error": "scanner not available"}
+    try:
+        signals = await scanner.run_scan_cycle()
+        return {"ok": True, "signals_detected": len(signals)}
+    except Exception as e:
+        logger.error(f"手動掃描失敗：{e}")
+        return {"ok": False, "error": str(e)}
+
