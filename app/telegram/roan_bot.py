@@ -2,7 +2,7 @@
 RoanTelegramBot — Telegram 機器人
 
 功能：
-1. 發送套利信號通知（含進場/出場/停損建議）
+1. 發送套利信號通知（含進場/出場/停損建議 + Polymarket 連結）
 2. Bot UI 市場選擇（用戶可選擇關注類別/市場）
 3. 每日報告發送
 4. 查詢信號與績效
@@ -101,6 +101,7 @@ class RoanTelegramBot:
             "chat_id": target,
             "text": text,
             "parse_mode": "HTML",
+            "disable_web_page_preview": True,
         }
         if reply_markup:
             payload["reply_markup"] = reply_markup
@@ -119,7 +120,7 @@ class RoanTelegramBot:
 
     async def send_signal(self, signal: dict) -> Optional[dict]:
         """
-        發送套利信號訊息（含進場/出場/停損建議）。
+        發送套利信號訊息（含進場/出場/停損建議 + Polymarket 直連連結）。
         高機率信號直接推送；其他依訂閱類別過濾。
         """
         signal_type = signal.get("signal_type", "")
@@ -158,6 +159,18 @@ class RoanTelegramBot:
         stop_loss = signal.get("stop_loss")
         direction = signal.get("direction", "YES")
 
+        # Polymarket 連結（從 target_market 取 slug）
+        slug = target_market.get("slug", "")
+        polymarket_id = target_market.get("polymarket_id", "")
+        if slug:
+            poly_url = f"https://polymarket.com/event/{slug}"
+        elif polymarket_id:
+            poly_url = f"https://polymarket.com/market/{polymarket_id}"
+        else:
+            poly_url = None
+
+        market_title = (target_market.get("title") or "")[:60]
+
         # 信心評級
         if confidence >= 0.80:
             conf_label = "🔥 極高"
@@ -176,6 +189,10 @@ class RoanTelegramBot:
                 f"🛡 停損：${stop_loss:.3f}\n"
             )
 
+        link_line = ""
+        if poly_url:
+            link_line = f"🔗 <a href='{poly_url}'>{market_title or '查看市場'}</a>\n"
+
         text = (
             f"{emoji} <b>{type_label}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -184,7 +201,8 @@ class RoanTelegramBot:
             f"🎯 置信度：{confidence:.1%} {conf_label}\n"
             f"💵 建議倉位：${suggested_position:.0f}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<pre>{detail[:400]}</pre>"
+            f"{link_line}"
+            f"<pre>{detail[:350]}</pre>"
         )
 
         return await self.send_message(text)
@@ -368,7 +386,7 @@ class RoanTelegramBot:
                     text("""
                         SELECT rs.signal_type, rs.profit_pct, rs.confidence,
                                rs.suggested_position, rs.status, rs.created_at,
-                               m.title, m.yes_price, m.category
+                               m.title, m.yes_price, m.category, m.slug, m.polymarket_id
                         FROM roan_signals rs
                         LEFT JOIN markets m ON m.id = rs.market_id
                         ORDER BY rs.created_at DESC
@@ -416,8 +434,18 @@ class RoanTelegramBot:
             created = row["created_at"]
             time_str = created.strftime("%m/%d %H:%M") if created else ""
 
+            # Polymarket 連結
+            slug = row.get("slug") or ""
+            pid = row.get("polymarket_id") or ""
+            if slug:
+                poly_link = f" | <a href='https://polymarket.com/event/{slug}'>→ 查看市場</a>"
+            elif pid:
+                poly_link = f" | <a href='https://polymarket.com/market/{pid}'>→ 查看市場</a>"
+            else:
+                poly_link = ""
+
             lines.append(
-                f"\n{emoji} {type_label} | {time_str}\n"
+                f"\n{emoji} {type_label} | {time_str}{poly_link}\n"
                 f"市場：{title}\n"
                 f"獲利：{profit:.2%}  置信度：{conf:.0%}  狀態：{status}"
             )
@@ -478,9 +506,14 @@ class RoanTelegramBot:
                 for m in mkts:
                     yes = m.get("yes_price")
                     liq = m.get("liquidity", 0)
+                    slug = m.get("slug", "")
                     yes_str = f"{yes:.0%}" if yes is not None else "N/A"
                     liq_str = f"${liq:,.0f}"
-                    lines.append(f"  • {m['title'][:60]}")
+                    title = m['title'][:55]
+                    if slug:
+                        lines.append(f"  • <a href='https://polymarket.com/event/{slug}'>{title}</a>")
+                    else:
+                        lines.append(f"  • {title}")
                     lines.append(f"    YES={yes_str}  流動性={liq_str}")
 
         lines.append("\n━━━━━━━━━━━━━━━━━━━━")
@@ -548,7 +581,8 @@ class RoanTelegramBot:
                 "📋 <b>每個信號均包含：</b>\n"
                 "• 進場價、目標價、停損價\n"
                 "• 置信度評級（🔥極高 / ✅高 / ⚠️中）\n"
-                "• 建議倉位大小\n\n"
+                "• 建議倉位大小\n"
+                "• 🔗 直連 Polymarket 市場頁面\n\n"
                 "📋 <b>指令：</b>\n"
                 "/marketlist — 列出目前掃描中的市場\n"
                 "/markets — 按類別篩選通知\n"

@@ -144,6 +144,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .market-item { padding: 8px 0; border-top: 1px solid #334155; }
   .market-item:first-of-type { border-top: none; }
   .market-title { font-size: 13px; color: #e2e8f0; margin-bottom: 4px; }
+  .market-title a { color: #e2e8f0; text-decoration: none; }
+  .market-title a:hover { color: #7c83fd; text-decoration: underline; }
   .market-meta { font-size: 11px; color: #64748b; display: flex; gap: 12px; }
   .yes-high { color: #4ade80; font-weight: 600; }
   .yes-low { color: #f87171; font-weight: 600; }
@@ -151,6 +153,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .refresh-btn:hover { background: #2563eb; }
   .last-update { font-size: 11px; color: #64748b; }
   .empty { text-align: center; padding: 40px; color: #64748b; }
+  .signal-link { color: #e2e8f0; text-decoration: none; }
+  .signal-link:hover { color: #7c83fd; text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -187,6 +191,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <script>
 const BASE = '';
+const POLY_BASE = 'https://polymarket.com/event/';
 const TYPE_MAP = {
   logic_arb: ['🔵', '邏輯依賴', 'badge-logic'],
   combo_arb: ['🟣', '多條件組合', 'badge-combo'],
@@ -209,6 +214,12 @@ function fmtTime(ts) {
   return d.toLocaleString('zh-TW', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' });
 }
 
+function polyUrl(slug, polymarket_id) {
+  if (slug) return POLY_BASE + slug;
+  if (polymarket_id) return 'https://polymarket.com/market/' + polymarket_id;
+  return null;
+}
+
 async function loadHealth() {
   try {
     const h = await fetchJSON(BASE + '/health');
@@ -220,7 +231,7 @@ async function loadHealth() {
 
 async function loadSignals() {
   try {
-    const data = await fetchJSON(BASE + '/api/signals?limit=20');
+    const data = await fetchJSON(BASE + '/api/signals?limit=50');
     const tbody = document.getElementById('signalsTable');
     document.getElementById('todaySignals').textContent = data.length;
     if (data.length === 0) {
@@ -232,9 +243,14 @@ async function loadSignals() {
     tbody.innerHTML = data.map(s => {
       const [em, label, cls] = TYPE_MAP[s.signal_type] || ['⚪', s.signal_type, ''];
       const conf = parseFloat(s.confidence || 0);
+      const url = polyUrl(s.slug, s.polymarket_id);
+      const titleText = (s.title || '').slice(0, 40) || '-';
+      const titleCell = url
+        ? `<a class="signal-link" href="${url}" target="_blank" rel="noopener" title="${s.title || ''}">${titleText}</a>`
+        : `<span title="${s.title || ''}">${titleText}</span>`;
       return `<tr>
         <td><span class="badge ${cls}">${em} ${label}</span></td>
-        <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${s.title || ''}">${(s.title || '').slice(0,40) || '-'}</td>
+        <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${titleCell}</td>
         <td>${s.entry_price != null ? '$' + parseFloat(s.entry_price).toFixed(3) : '-'}</td>
         <td>${s.target_price != null ? '$' + parseFloat(s.target_price).toFixed(3) : '-'}</td>
         <td>${s.stop_loss != null ? '$' + parseFloat(s.stop_loss).toFixed(3) : '-'}</td>
@@ -268,8 +284,12 @@ async function loadMarkets() {
           const yes = m.yes_price;
           const yesStr = yes != null ? (yes * 100).toFixed(0) + '%' : 'N/A';
           const yesClass = yes >= 0.7 ? 'yes-high' : yes <= 0.15 ? 'yes-low' : '';
+          const url = m.slug ? POLY_BASE + m.slug : null;
+          const titleHtml = url
+            ? `<a href="${url}" target="_blank" rel="noopener">${m.title.slice(0, 65)}</a>`
+            : m.title.slice(0, 65);
           return `<div class="market-item">
-            <div class="market-title">${m.title.slice(0, 65)}</div>
+            <div class="market-title">${titleHtml}</div>
             <div class="market-meta">
               <span class="${yesClass}">YES=${yesStr}</span>
               <span>流動性=$${(m.liquidity || 0).toLocaleString()}</span>
@@ -316,15 +336,16 @@ async def health():
 
 @app.get("/api/signals")
 async def get_signals(
-    limit: int = Query(default=20, ge=1, le=200),
+    limit: int = Query(default=50, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return the most recent arbitrage signals with market titles."""
+    """Return the most recent arbitrage signals with market titles and Polymarket links."""
     result = await db.execute(
         text(
             "SELECT rs.id, rs.market_id, rs.signal_type, rs.profit_pct, rs.confidence, "
-            "rs.suggested_position, rs.status, rs.created_at, "
-            "m.title, m.yes_price, m.category "
+            "rs.suggested_position, rs.entry_price, rs.target_price, rs.stop_loss, "
+            "rs.direction, rs.status, rs.created_at, "
+            "m.title, m.yes_price, m.category, m.slug, m.polymarket_id "
             "FROM roan_signals rs "
             "LEFT JOIN markets m ON m.id = rs.market_id "
             "ORDER BY rs.created_at DESC LIMIT :limit"

@@ -186,6 +186,7 @@ class PolymarketClient:
         return {
             "id": raw.get("conditionId") or raw.get("id"),
             "polymarket_id": raw.get("conditionId") or raw.get("id"),
+            "slug": raw.get("slug") or raw.get("marketSlug") or "",
             "title": raw.get("question") or raw.get("title"),
             "yes_price": yes_price,
             "no_price": no_price,
@@ -214,15 +215,16 @@ class PolymarketClient:
 
         upsert_sql = text("""
             INSERT INTO markets (
-                polymarket_id, category, title,
+                polymarket_id, category, title, slug,
                 yes_price, no_price, liquidity, end_timestamp, rules, updated_at
             ) VALUES (
-                :polymarket_id, :category, :title,
+                :polymarket_id, :category, :title, :slug,
                 :yes_price, :no_price, :liquidity, :end_timestamp, :rules, NOW()
             )
             ON CONFLICT (polymarket_id) DO UPDATE SET
                 category = EXCLUDED.category,
                 title = EXCLUDED.title,
+                slug = EXCLUDED.slug,
                 yes_price = EXCLUDED.yes_price,
                 no_price = EXCLUDED.no_price,
                 liquidity = EXCLUDED.liquidity,
@@ -239,6 +241,7 @@ class PolymarketClient:
                         "polymarket_id": market.get("polymarket_id"),
                         "category": market.get("category", "other"),
                         "title": market.get("title"),
+                        "slug": market.get("slug", ""),
                         "yes_price": market.get("yes_price"),
                         "no_price": market.get("no_price"),
                         "liquidity": market.get("liquidity", 0),
