@@ -177,7 +177,6 @@ class RoanScanner:
             now_str = _dt.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
             if self._signals_since_last_hourly > 0:
-                # 這小時有信號，摘要顯示
                 sig_count = self._signals_since_last_hourly
                 text = (
                     f"⏰ <b>每小時掃描摘要</b> | {now_str}\n"
@@ -188,7 +187,6 @@ class RoanScanner:
                     f"🔗 <a href='https://polybot-production-7c05.up.railway.app'>Dashboard</a>"
                 )
             else:
-                # 這小時無匹配信號
                 text = (
                     f"⏰ <b>每小時掃描摘要</b> | {now_str}\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -447,7 +445,7 @@ class RoanScanner:
     # ─── 工具方法 ───────────────────────────────────────────────────────────────
 
     def get_last_markets_summary(self) -> dict:
-        """回傳最近一次掃描的市場摘要（供 Telegram /marketlist 指令使用）。"""
+        """回傳最近一次掃描的市場摘要（含 slug 供網頁連結使用）。"""
         by_category: Dict[str, List[dict]] = {}
         for mkt in self._last_markets:
             cat = mkt.get("category", "other")
@@ -461,6 +459,7 @@ class RoanScanner:
                         "title": m.get("title", "")[:80],
                         "yes_price": m.get("yes_price"),
                         "liquidity": m.get("liquidity", 0),
+                        "slug": m.get("slug", ""),
                     }
                     for m in sorted(mkts, key=lambda m: m.get("liquidity", 0), reverse=True)[:5]
                 ]
