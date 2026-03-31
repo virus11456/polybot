@@ -155,6 +155,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .empty { text-align: center; padding: 40px; color: #64748b; }
   .signal-link { color: #e2e8f0; text-decoration: none; }
   .signal-link:hover { color: #7c83fd; text-decoration: underline; }
+  /* Guide section */
+  .guide-wrap { background: #1e293b; border: 1px solid #334155; border-radius: 12px; margin-bottom: 24px; overflow: hidden; }
+  .guide-header { padding: 14px 20px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; user-select: none; }
+  .guide-header:hover { background: #263348; }
+  .guide-header h2 { font-size: 15px; font-weight: 600; color: #f1f5f9; }
+  .guide-toggle { color: #64748b; font-size: 18px; transition: transform .2s; }
+  .guide-body { padding: 0 20px 20px; display: none; }
+  .guide-body.open { display: block; }
+  .guide-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-bottom: 20px; }
+  .guide-card { background: #0f172a; border: 1px solid #1e293b; border-radius: 10px; padding: 16px; }
+  .guide-card h3 { font-size: 13px; font-weight: 700; margin-bottom: 10px; }
+  .guide-card p, .guide-card li { font-size: 12px; color: #94a3b8; line-height: 1.6; }
+  .guide-card ul { padding-left: 16px; }
+  .guide-card li { margin-bottom: 4px; }
+  .guide-rule { background: #0f172a; border-radius: 10px; padding: 16px; margin-top: 4px; }
+  .guide-rule h3 { font-size: 13px; font-weight: 700; margin-bottom: 12px; color: #f1f5f9; }
+  .rule-row { display: flex; gap: 12px; margin-bottom: 10px; align-items: flex-start; }
+  .rule-badge { flex-shrink: 0; font-size: 20px; line-height: 1; }
+  .rule-desc { font-size: 12px; color: #94a3b8; line-height: 1.6; }
+  .rule-desc strong { color: #e2e8f0; font-weight: 600; }
+  .indicator-table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+  .indicator-table th { background: #1e293b; font-size: 11px; color: #64748b; text-transform: uppercase; padding: 8px 12px; text-align: left; }
+  .indicator-table td { padding: 8px 12px; border-top: 1px solid #1e293b; font-size: 12px; color: #94a3b8; }
+  .indicator-table td:first-child { color: #e2e8f0; font-weight: 600; white-space: nowrap; }
+  .tip-box { background: #162032; border: 1px solid #1d4ed822; border-radius: 8px; padding: 12px 16px; margin-top: 12px; }
+  .tip-box p { font-size: 12px; color: #7c83fd; line-height: 1.6; }
+  .tip-box strong { color: #a5b4fc; }
 </style>
 </head>
 <body>
@@ -187,6 +214,152 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   <div class="section-title">🌐 市場概況（各類別前5名）</div>
   <div class="markets-grid" id="marketsGrid">載入中...</div>
+
+  <!-- 指標說明與操作指南 -->
+  <div class="guide-wrap">
+    <div class="guide-header" onclick="toggleGuide()">
+      <h2>📖 指標說明 &amp; 操作指南（點擊展開）</h2>
+      <span class="guide-toggle" id="guideToggle">▼</span>
+    </div>
+    <div class="guide-body" id="guideBody">
+
+      <!-- 信號類型說明 -->
+      <div class="guide-rule" style="margin-bottom:16px">
+        <h3>🔷 信號類型說明</h3>
+        <div class="rule-row">
+          <div class="rule-badge">🟢</div>
+          <div class="rule-desc">
+            <strong>高機率 YES 進場</strong><br>
+            市場 YES 機率 &gt; 70%，且流動性 &gt; $50,000。<br>
+            代表市場認為此事件「很可能發生」，買入 YES 等待結算收益。<br>
+            ✅ <strong>操作：買 YES</strong>（在 Polymarket 選擇 YES）
+          </div>
+        </div>
+        <div class="rule-row">
+          <div class="rule-badge">🔴</div>
+          <div class="rule-desc">
+            <strong>高機率 NO 進場</strong><br>
+            市場 YES 機率 &lt; 15%（即 NO 機率 &gt; 85%），且流動性 &gt; $50,000。<br>
+            代表市場認為此事件「幾乎不會發生」，買入 NO 等待結算收益。<br>
+            ✅ <strong>操作：買 NO</strong>（在 Polymarket 選擇 NO）
+          </div>
+        </div>
+        <div class="rule-row">
+          <div class="rule-badge">🔵</div>
+          <div class="rule-desc">
+            <strong>邏輯依賴套利</strong><br>
+            兩個市場存在因果關係（例如「颶風發生」→「降雨增加」），
+            但價格出現矛盾：觸發市場 YES 很高，依賴市場 YES 卻偏低，被低估了。<br>
+            ✅ <strong>操作：買依賴市場的 YES</strong>（等它漲回合理水準）
+          </div>
+        </div>
+        <div class="rule-row">
+          <div class="rule-badge">🟣</div>
+          <div class="rule-desc">
+            <strong>多條件組合套利</strong><br>
+            同一類別下，多個高度相關的市場 YES 均偏高，
+            但聯合機率被市場低估，存在相關性修正空間。<br>
+            ✅ <strong>操作：同時買入兩個相關市場的 YES</strong>
+          </div>
+        </div>
+      </div>
+
+      <!-- 指標欄位說明 -->
+      <div style="margin-bottom:16px">
+        <h3 style="font-size:13px;font-weight:700;margin-bottom:10px;color:#f1f5f9">📋 信號表格欄位說明</h3>
+        <table class="indicator-table">
+          <thead><tr><th>欄位</th><th>說明</th><th>如何使用</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>進場 (Entry)</td>
+              <td>建議進場價格（以 Polymarket 股數計算，範圍 $0~$1）</td>
+              <td>在 Polymarket 以接近此價格買入 YES 或 NO</td>
+            </tr>
+            <tr>
+              <td>目標 (Target)</td>
+              <td>預期出場價格（此價格時獲利了結）</td>
+              <td>當市場價格到達目標價時，可考慮賣出獲利</td>
+            </tr>
+            <tr>
+              <td>停損 (Stop Loss)</td>
+              <td>停損價格（此價格代表判斷可能有誤）</td>
+              <td>若市場反向到達停損價，建議出場控制損失</td>
+            </tr>
+            <tr>
+              <td>獲利 %</td>
+              <td>從進場到目標的預期報酬率</td>
+              <td>越高代表潛在報酬越大，但需結合置信度判斷</td>
+            </tr>
+            <tr>
+              <td>置信度</td>
+              <td>系統對此信號的信心程度（50%~90%）</td>
+              <td>≥80% 極高信心（🔥）、65-80% 高信心（✅）、55-65% 中等（⚠️）</td>
+            </tr>
+            <tr>
+              <td>倉位 ($)</td>
+              <td>建議投入金額（根據流動性與置信度計算，最多 $500）</td>
+              <td>此為建議參考，請根據自身風險承受能力調整</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- 操作步驟 -->
+      <div class="guide-grid">
+        <div class="guide-card">
+          <h3 style="color:#4ade80">✅ 何時買 YES？</h3>
+          <ul>
+            <li>看到 🟢 <strong>高機率 YES</strong> 信號</li>
+            <li>YES 機率 &gt; 70%，代表市場認為事件很可能發生</li>
+            <li>置信度 ≥ 65% 時操作更安全</li>
+            <li>在 Polymarket 點擊市場，選擇 <strong>Yes</strong>，以接近進場價買入</li>
+            <li>目標價時賣出，或持有到結算（市場結束時若 YES 成真 = $1/股）</li>
+          </ul>
+        </div>
+        <div class="guide-card">
+          <h3 style="color:#f87171">🚫 何時買 NO？</h3>
+          <ul>
+            <li>看到 🔴 <strong>高機率 NO</strong> 信號</li>
+            <li>YES 機率 &lt; 15%，即 NO 機率 &gt; 85%</li>
+            <li>代表市場認為事件幾乎不會發生</li>
+            <li>在 Polymarket 點擊市場，選擇 <strong>No</strong>，以接近進場價買入</li>
+            <li>持有到結算（若事件未發生 = $1/股）</li>
+          </ul>
+        </div>
+        <div class="guide-card">
+          <h3 style="color:#fbbf24">⚠️ 風險提示</h3>
+          <ul>
+            <li>Polymarket 是預測市場，所有交易均有風險</li>
+            <li>置信度代表算法信心，<strong>不保證獲利</strong></li>
+            <li>建議每筆交易不超過可用資金的 5%</li>
+            <li>停損價是重要防護，務必遵守</li>
+            <li>高流動性市場（&gt;$50k）信號更可靠</li>
+            <li>新手建議先小額測試，熟悉規則後再加大</li>
+          </ul>
+        </div>
+        <div class="guide-card">
+          <h3 style="color:#60a5fa">🔵 如何看邏輯依賴信號？</h3>
+          <ul>
+            <li>觸發市場 YES 高（如颶風=70%），但依賴市場 YES 低（如降雨=30%）</li>
+            <li>邏輯上，颶風發生→降雨機率應更高，降雨被低估</li>
+            <li>操作：買 <strong>依賴市場</strong>（降雨）的 YES</li>
+            <li>等待市場修正：降雨 YES 從 30% 漲回合理水準</li>
+            <li>進場=30%，目標=60%（颶風70%×85%），獲利=100%+</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="tip-box">
+        <p>💡 <strong>快速判斷法則：</strong>
+        看到 🟢 → 買 YES；看到 🔴 → 買 NO；看到 🔵🟣 → 買依賴/低估市場的 YES。
+        置信度 ≥ 65% + 流動性 &gt; $10k = 較可靠信號。
+        進場價代表「此刻市場定價」，低進場價（如 $0.30）風險較低但需事件發生才獲利。
+        </p>
+      </div>
+
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -198,6 +371,13 @@ const TYPE_MAP = {
   high_prob_yes: ['🟢', '高機率YES', 'badge-yes'],
   high_prob_no: ['🔴', '高機率NO', 'badge-no'],
 };
+
+function toggleGuide() {
+  const body = document.getElementById('guideBody');
+  const toggle = document.getElementById('guideToggle');
+  body.classList.toggle('open');
+  toggle.style.transform = body.classList.contains('open') ? 'rotate(180deg)' : '';
+}
 
 async function fetchJSON(url) {
   const r = await fetch(url);
