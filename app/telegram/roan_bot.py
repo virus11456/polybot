@@ -2,7 +2,7 @@
 RoanTelegramBot — Telegram 機器人
 
 功能：
-1. 發送套利信號通知
+1. 發送套利信號通知（含進場/出場/停損建議）
 2. Bot UI 市場選擇（用戶可選擇關注類別/市場）
 3. 每日報告發送
 4. 查詢信號與績效
@@ -119,37 +119,72 @@ class RoanTelegramBot:
 
     async def send_signal(self, signal: dict) -> Optional[dict]:
         """
-        發送套利信號訊息。
-        僅發送給已訂閱對應類別的用戶。
+        發送套利信號訊息（含進場/出場/停損建議）。
+        高機率信號直接推送；其他依訂閱類別過濾。
         """
         signal_type = signal.get("signal_type", "")
         target_market = signal.get("target_market", {})
         category = target_market.get("category", "other")
 
-        # 檢查訂閱
-        subscribed_cats = self._subscriptions.get(self.chat_id, [])
-        if category not in subscribed_cats:
-            logger.debug(f"Chat {self.chat_id} 未訂閱 {category}，跳過信號")
-            return None
+        # 高機率信號不過濾類別，直接推送
+        if signal_type not in ("high_prob_yes", "high_prob_no"):
+            subscribed_cats = self._subscriptions.get(self.chat_id, [])
+            if category not in subscribed_cats:
+                logger.debug(f"Chat {self.chat_id} 未訂閱 {category}，跳過信號")
+                return None
 
-        emoji = "🔵" if signal_type == "logic_arb" else "🟣"
-        type_label = "邏輯依賴套利" if signal_type == "logic_arb" else "多條件組合套利"
+        emoji_map = {
+            "logic_arb": "🔵",
+            "combo_arb": "🟣",
+            "high_prob_yes": "🟢",
+            "high_prob_no": "🔴",
+        }
+        label_map = {
+            "logic_arb": "邏輯依賴套利",
+            "combo_arb": "多條件組合套利",
+            "high_prob_yes": "高機率 YES 直接進場",
+            "high_prob_no": "高機率 NO 直接進場",
+        }
+        emoji = emoji_map.get(signal_type, "⚪")
+        type_label = label_map.get(signal_type, signal_type)
 
         profit_pct = signal.get("profit_pct", 0)
         confidence = signal.get("confidence", 0)
         suggested_position = signal.get("suggested_position", 0)
         detail = signal.get("detail", "")
         rule_desc = signal.get("rule_desc", "")
+        entry_price = signal.get("entry_price")
+        target_price = signal.get("target_price")
+        stop_loss = signal.get("stop_loss")
+        direction = signal.get("direction", "YES")
+
+        # 信心評級
+        if confidence >= 0.80:
+            conf_label = "🔥 極高"
+        elif confidence >= 0.65:
+            conf_label = "✅ 高"
+        elif confidence >= 0.55:
+            conf_label = "⚠️ 中"
+        else:
+            conf_label = "❓ 低"
+
+        price_lines = ""
+        if entry_price is not None:
+            price_lines = (
+                f"📈 進場：${entry_price:.3f}（買 {direction}）  "
+                f"🎯 目標：${target_price:.3f}（+{profit_pct:.1%}）  "
+                f"🛡 停損：${stop_loss:.3f}\n"
+            )
 
         text = (
             f"{emoji} <b>{type_label}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📌 規則：{rule_desc}\n"
-            f"💹 預期獲利：{profit_pct:.2%}\n"
-            f"🎯 置信度：{confidence:.1%}\n"
-            f"💵 建議倉位：${suggested_position:.2f}\n"
+            f"📌 {rule_desc}\n"
+            f"{price_lines}"
+            f"🎯 置信度：{confidence:.1%} {conf_label}\n"
+            f"💵 建議倉位：${suggested_position:.0f}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<pre>{detail[:300]}</pre>"
+            f"<pre>{detail[:400]}</pre>"
         )
 
         return await self.send_message(text)
@@ -208,10 +243,7 @@ class RoanTelegramBot:
                 subscribed.append(cat_key)
                 action = "已訂閱"
 
-            # 回應 callback
             await self._answer_callback(callback_id, f"{action} {AVAILABLE_CATEGORIES.get(cat_key, cat_key)}")
-
-            # 更新選擇 UI
             await self.send_category_selector(chat_id=chat_id)
 
         elif data == "confirm_cats":
@@ -249,7 +281,6 @@ class RoanTelegramBot:
             from sqlalchemy import text
 
             async with AsyncSessionLocal() as session:
-                # 取績效數據
                 perf_result = await session.execute(
                     text("""
                         SELECT signals_sent, signals_profitable, total_profit_usd, capital_used
@@ -260,7 +291,6 @@ class RoanTelegramBot:
                 )
                 perf = perf_result.mappings().first()
 
-                # 取今日信號數量（按類型分組）
                 sig_result = await session.execute(
                     text("""
                         SELECT signal_type, COUNT(*) as cnt, AVG(profit_pct) as avg_profit
@@ -298,7 +328,13 @@ class RoanTelegramBot:
         if sig_rows:
             sig_text = "\n🔍 信號分布：\n"
             for row in sig_rows:
-                type_label = "邏輯依賴" if row["signal_type"] == "logic_arb" else "多條件組合"
+                label_map = {
+                    "logic_arb": "邏輯依賴",
+                    "combo_arb": "多條件組合",
+                    "high_prob_yes": "高機率YES",
+                    "high_prob_no": "高機率NO",
+                }
+                type_label = label_map.get(row["signal_type"], row["signal_type"])
                 sig_text += f"• {type_label}：{row['cnt']} 個，平均獲利 {float(row['avg_profit'] or 0):.2%}\n"
         else:
             sig_text = "\n🔍 今日無套利信號偵測。\n"
@@ -354,11 +390,25 @@ class RoanTelegramBot:
             )
             return
 
+        emoji_map = {
+            "logic_arb": "🔵",
+            "combo_arb": "🟣",
+            "high_prob_yes": "🟢",
+            "high_prob_no": "🔴",
+        }
+        label_map = {
+            "logic_arb": "邏輯依賴",
+            "combo_arb": "多條件組合",
+            "high_prob_yes": "高機率YES",
+            "high_prob_no": "高機率NO",
+        }
+
         lines = [f"🔍 <b>最新 {len(rows)} 筆套利信號</b>", "━━━━━━━━━━━━━━━━━━━━"]
 
         for row in rows:
-            emoji = "🔵" if row["signal_type"] == "logic_arb" else "🟣"
-            type_label = "邏輯依賴" if row["signal_type"] == "logic_arb" else "多條件組合"
+            stype = row["signal_type"]
+            emoji = emoji_map.get(stype, "⚪")
+            type_label = label_map.get(stype, stype)
             title = (row["title"] or "（未知市場）")[:50]
             profit = float(row["profit_pct"] or 0)
             conf = float(row["confidence"] or 0)
@@ -436,7 +486,6 @@ class RoanTelegramBot:
         lines.append("\n━━━━━━━━━━━━━━━━━━━━")
         lines.append("使用 /markets 可按類別篩選通知。")
 
-        # Split into chunks to avoid Telegram 4096-char limit
         full_text = "\n".join(lines)
         chunk_size = 3800
         for i in range(0, len(full_text), chunk_size):
@@ -470,7 +519,8 @@ class RoanTelegramBot:
                 "/markets — 選擇關注的市場類別\n"
                 "/signals — 查看最新套利信號\n"
                 "/report — 取得今日報告\n"
-                "/help — 顯示說明",
+                "/help — 顯示說明\n\n"
+                "📊 <b>網頁 Dashboard：</b>\nhttps://polybot-production-7c05.up.railway.app",
                 chat_id=chat_id
             )
 
@@ -490,15 +540,20 @@ class RoanTelegramBot:
             await self.send_message(
                 "📖 <b>Roan 套利機器說明</b>\n\n"
                 "本機器人偵測 Polymarket 上的套利機會：\n\n"
+                "🟢 <b>高機率 YES 進場</b>：YES > 70% 且流動性高，直接買入 YES，等結算獲利。\n\n"
+                "🔴 <b>高機率 NO 進場</b>：YES < 15%（NO > 85%），買入 NO，等結算獲利。\n\n"
                 "🔵 <b>邏輯依賴套利</b>：基於事件因果關係（如雷雨→下雨），"
                 "若觸發市場 YES 高但依賴市場 YES 偏低，則依賴市場被低估。\n\n"
-                "🟣 <b>多條件組合套利</b>：同類別多市場相關性修正，"
-                "若多個相關市場 YES 均偏高但聯合機率被低估，則存在組合套利機會。\n\n"
+                "🟣 <b>多條件組合套利</b>：同類別多市場相關性修正。\n\n"
+                "📋 <b>每個信號均包含：</b>\n"
+                "• 進場價、目標價、停損價\n"
+                "• 置信度評級（🔥極高 / ✅高 / ⚠️中）\n"
+                "• 建議倉位大小\n\n"
                 "📋 <b>指令：</b>\n"
-                "/marketlist — 列出目前鎖定掃描中的所有市場（按類別）\n"
-                "/markets — 按類別篩選要接收的通知\n"
-                "/signals — 查看最新 10 筆套利信號\n"
+                "/marketlist — 列出目前掃描中的市場\n"
+                "/markets — 按類別篩選通知\n"
+                "/signals — 查看最新信號\n"
                 "/report — 查看今日績效報告\n\n"
-                "掃描頻率：每 60 秒一次（可透過 SCAN_INTERVAL_SECONDS 環境變數調整）",
+                "📊 Dashboard：https://polybot-production-7c05.up.railway.app",
                 chat_id=chat_id
             )

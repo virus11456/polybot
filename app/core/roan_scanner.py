@@ -4,7 +4,8 @@ RoanScanner — 套利信號偵測引擎
 功能：
 1. 邏輯依賴套利：偵測有因果依賴關係的市場對（如雷雨→下雨）
 2. 多條件組合掃描：找出多個市場共同條件下的聯合套利機會
-3. 持續掃描循環：定期從 Polymarket 拉取市場並發出信號
+3. 高機率市場掃描：偵測 YES/NO 機率極高的市場（直接進場）
+4. 持續掃描循環：定期從 Polymarket 拉取市場並發出信號
 """
 
 import asyncio
@@ -49,11 +50,16 @@ LOGIC_DEPENDENCY_RULES: List[Tuple[List[str], List[str], str]] = [
 COMBO_SCAN_CATEGORIES = ["weather", "politics", "macro", "geopolitical"]
 
 # 套利信號觸發閾值
-MIN_LIQUIDITY = 1000.0       # 最低流動性（USD）
-MIN_PROFIT_PCT = 0.02        # 最低套利空間 2%
-MIN_CONFIDENCE = 0.55        # 最低置信度
-LOGIC_ARB_THRESHOLD = 0.08   # 邏輯依賴套利價差閾值：依賴市場 YES 偏低超過 8%
-COMBO_PRICE_DIFF_THRESHOLD = 0.10  # 多條件組合套利價差閾值
+MIN_LIQUIDITY = 500.0        # 最低流動性（USD）— 降低門檻增加信號
+MIN_PROFIT_PCT = 0.015       # 最低套利空間 1.5%
+MIN_CONFIDENCE = 0.50        # 最低置信度
+LOGIC_ARB_THRESHOLD = 0.05   # 邏輯依賴套利價差閾值：降至 5%
+COMBO_PRICE_DIFF_THRESHOLD = 0.08  # 多條件組合套利價差閾值
+
+# 高機率直接進場閾值
+HIGH_PROB_YES_THRESHOLD = 0.70  # YES > 70% 考慮 YES 直接買入
+HIGH_PROB_NO_THRESHOLD = 0.15   # YES < 15%（即 NO > 85%）考慮 NO 買入
+HIGH_PROB_MIN_LIQUIDITY = 50000  # 高機率掃描需要較高流動性
 
 
 class RoanScanner:
@@ -75,6 +81,8 @@ class RoanScanner:
         # 快取最新掃描到的市場列表（供 TG /marketlist 查詢）
         self._last_markets: List[dict] = []
         self._last_scan_time: Optional[str] = None
+        # 已發送過的高機率市場（避免重複推送）
+        self._sent_high_prob: set = set()
 
     async def continuous_scan(self):
         """持續掃描循環（在後台 task 中執行）。"""
@@ -104,25 +112,125 @@ class RoanScanner:
 
         all_signals = []
 
-        # 1. 邏輯依賴套利掃描
+        # 1. 高機率直接進場掃描（最優先）
+        high_prob_signals = await self._scan_high_probability(markets)
+        all_signals.extend(high_prob_signals)
+        logger.info(f"高機率直接進場：偵測到 {len(high_prob_signals)} 個信號")
+
+        # 2. 邏輯依賴套利掃描
         logic_signals = await self._scan_logic_dependency(markets)
         all_signals.extend(logic_signals)
         logger.info(f"邏輯依賴套利：偵測到 {len(logic_signals)} 個信號")
 
-        # 2. 多條件組合掃描
+        # 3. 多條件組合掃描
         combo_signals = await self._scan_multi_condition(markets)
         all_signals.extend(combo_signals)
         logger.info(f"多條件組合：偵測到 {len(combo_signals)} 個信號")
 
-        # 3. 儲存信號至 DB
+        # 4. 儲存信號至 DB
         if all_signals:
             await self._store_signals(all_signals)
 
-        # 4. 發送 Telegram 通知
+        # 5. 發送 Telegram 通知
         if all_signals:
             await self._send_telegram_signals(all_signals)
 
         return all_signals
+
+    # ─── 高機率直接進場掃描 ──────────────────────────────────────────────────
+
+    async def _scan_high_probability(self, markets: List[dict]) -> List[dict]:
+        """
+        掃描高機率直接進場機會。
+        - YES > 70%：機率偏高，買入 YES，預期持有到結算
+        - YES < 15%（NO > 85%）：機率偏低，買入 NO
+        只針對流動性 > $50,000 的市場，避免低流動性陷阱。
+        """
+        signals = []
+
+        for mkt in markets:
+            pid = mkt.get("polymarket_id", "")
+            if pid in self._sent_high_prob:
+                continue
+
+            yes = mkt.get("yes_price")
+            liq = mkt.get("liquidity", 0)
+            if yes is None or liq < HIGH_PROB_MIN_LIQUIDITY:
+                continue
+
+            title = mkt.get("title", "")[:80]
+
+            # YES > 70%: 直接買入 YES
+            if yes >= HIGH_PROB_YES_THRESHOLD:
+                entry_price = yes
+                # 目標：結算時 YES = 1.0（賺取 1 - entry 每股）
+                target_price = min(0.99, yes + (1.0 - yes) * 0.5)  # 保守目標：收益一半
+                stop_loss = max(0.01, yes - (1.0 - yes) * 0.3)    # 停損：當前空間的 30%
+                profit_pct = (target_price - entry_price) / entry_price
+                confidence = min(0.90, 0.60 + (yes - 0.70) * 1.0)
+                position_size = self._calc_position(liq, confidence)
+
+                if profit_pct >= MIN_PROFIT_PCT and confidence >= MIN_CONFIDENCE:
+                    self._sent_high_prob.add(pid)
+                    signals.append({
+                        "signal_type": "high_prob_yes",
+                        "trigger_market": mkt,
+                        "target_market": mkt,
+                        "profit_pct": round(profit_pct, 4),
+                        "confidence": round(confidence, 3),
+                        "rule_desc": f"高機率 YES 直接進場（YES={yes:.1%}）",
+                        "entry_price": round(entry_price, 4),
+                        "target_price": round(target_price, 4),
+                        "stop_loss": round(stop_loss, 4),
+                        "position_size": round(position_size, 2),
+                        "direction": "YES",
+                        "detail": (
+                            f"[高機率 YES] {title}\n"
+                            f"現價：YES={yes:.2%}  流動性：${liq:,.0f}\n"
+                            f"📈 進場：${entry_price:.3f}\n"
+                            f"🎯 目標：${target_price:.3f}（+{profit_pct:.1%}）\n"
+                            f"🛡 停損：${stop_loss:.3f}\n"
+                            f"💰 建議倉位：${position_size:.0f}"
+                        ),
+                        "suggested_position": position_size,
+                    })
+
+            # YES < 15% (NO > 85%): 買入 NO
+            elif yes <= HIGH_PROB_NO_THRESHOLD:
+                no_price = 1.0 - yes
+                entry_price = no_price  # NO 進場價
+                target_price = min(0.99, no_price + (1.0 - no_price) * 0.5)
+                stop_loss = max(0.01, no_price - (1.0 - no_price) * 0.3)
+                profit_pct = (target_price - entry_price) / entry_price
+                confidence = min(0.88, 0.55 + (HIGH_PROB_NO_THRESHOLD - yes) * 2.0)
+                position_size = self._calc_position(liq, confidence)
+
+                if profit_pct >= MIN_PROFIT_PCT and confidence >= MIN_CONFIDENCE:
+                    self._sent_high_prob.add(pid)
+                    signals.append({
+                        "signal_type": "high_prob_no",
+                        "trigger_market": mkt,
+                        "target_market": mkt,
+                        "profit_pct": round(profit_pct, 4),
+                        "confidence": round(confidence, 3),
+                        "rule_desc": f"高機率 NO 直接進場（NO={no_price:.1%}）",
+                        "entry_price": round(entry_price, 4),
+                        "target_price": round(target_price, 4),
+                        "stop_loss": round(stop_loss, 4),
+                        "position_size": round(position_size, 2),
+                        "direction": "NO",
+                        "detail": (
+                            f"[高機率 NO] {title}\n"
+                            f"現價：NO={no_price:.2%}  流動性：${liq:,.0f}\n"
+                            f"📈 進場：${entry_price:.3f}\n"
+                            f"🎯 目標：${target_price:.3f}（+{profit_pct:.1%}）\n"
+                            f"🛡 停損：${stop_loss:.3f}\n"
+                            f"💰 建議倉位：${position_size:.0f}"
+                        ),
+                        "suggested_position": position_size,
+                    })
+
+        return signals
 
     # ─── 邏輯依賴套利 ──────────────────────────────────────────────────────────
 
@@ -156,16 +264,18 @@ class RoanScanner:
                     if d_yes is None or d_liquidity < MIN_LIQUIDITY:
                         continue
 
-                    # 邏輯套利：若 A YES 高（例如0.75），B YES 應至少等於 A YES 乘上一個合理係數
-                    # 若 B YES 低於 t_yes - threshold，則 B YES 被低估
-                    expected_d_yes = t_yes * 0.85  # 依賴市場至少應有觸發市場 85% 的機率
+                    expected_d_yes = t_yes * 0.85
                     price_gap = expected_d_yes - d_yes
 
                     if price_gap >= LOGIC_ARB_THRESHOLD:
                         profit_pct = float(price_gap)
                         confidence = min(0.9, 0.6 + (float(t_yes) - 0.5) * 0.5 + price_gap * 0.3)
+                        entry_price = d_yes
+                        target_price = min(0.99, expected_d_yes)
+                        stop_loss = max(0.01, d_yes - price_gap * 0.5)
 
                         if confidence >= MIN_CONFIDENCE and profit_pct >= MIN_PROFIT_PCT:
+                            position_size = self._calc_position(d_liquidity, confidence)
                             signals.append({
                                 "signal_type": "logic_arb",
                                 "trigger_market": t_mkt,
@@ -173,13 +283,20 @@ class RoanScanner:
                                 "profit_pct": round(profit_pct, 4),
                                 "confidence": round(confidence, 3),
                                 "rule_desc": rule_desc,
+                                "entry_price": round(entry_price, 4),
+                                "target_price": round(target_price, 4),
+                                "stop_loss": round(stop_loss, 4),
+                                "position_size": round(position_size, 2),
+                                "direction": "YES",
                                 "detail": (
                                     f"[邏輯依賴] {rule_desc}\n"
                                     f"觸發：{t_mkt.get('title', '')[:50]} YES={t_yes:.2%}\n"
                                     f"依賴：{d_mkt.get('title', '')[:50]} YES={d_yes:.2%}\n"
-                                    f"預期 YES≥{expected_d_yes:.2%}，差距 {price_gap:.2%}"
+                                    f"預期 YES≥{expected_d_yes:.2%}，差距 {price_gap:.2%}\n"
+                                    f"📈 進場：${entry_price:.3f}  🎯 目標：${target_price:.3f}  🛡 停損：${stop_loss:.3f}\n"
+                                    f"💰 建議倉位：${position_size:.0f}"
                                 ),
-                                "suggested_position": self._calc_position(d_liquidity, confidence),
+                                "suggested_position": position_size,
                             })
 
         return signals
@@ -221,18 +338,13 @@ class RoanScanner:
                     yes1 = m1.get("yes_price", 0)
                     yes2 = m2.get("yes_price", 0)
 
-                    # 若兩市場有相關關鍵字重疊，聯合機率應更高
                     overlap = self._keyword_overlap(
                         m1.get("title", ""), m2.get("title", "")
                     )
                     if overlap < 1:
-                        continue  # 無足夠關鍵字重疊
+                        continue
 
-                    # 聯合機率（獨立假設下）= yes1 * yes2
-                    # 若市場相關性高，實際聯合機率 > yes1 * yes2
-                    # 套利：各自買 YES，預期聯合獲利
                     independent_joint = yes1 * yes2
-                    # 假設相關係數 0.4 修正
                     correlated_joint = yes1 * yes2 + 0.4 * (1 - yes1) * (1 - yes2) * min(yes1, yes2)
                     price_gap = correlated_joint - independent_joint
 
@@ -240,8 +352,13 @@ class RoanScanner:
                         avg_liquidity = (m1.get("liquidity", 0) + m2.get("liquidity", 0)) / 2
                         profit_pct = float(price_gap)
                         confidence = min(0.85, 0.55 + overlap * 0.1 + price_gap * 2)
+                        avg_yes = (yes1 + yes2) / 2
+                        entry_price = avg_yes
+                        target_price = min(0.99, avg_yes + price_gap)
+                        stop_loss = max(0.01, avg_yes - price_gap * 0.5)
 
                         if confidence >= MIN_CONFIDENCE and profit_pct >= MIN_PROFIT_PCT:
+                            position_size = self._calc_position(avg_liquidity, confidence)
                             signals.append({
                                 "signal_type": "combo_arb",
                                 "trigger_market": m1,
@@ -249,13 +366,20 @@ class RoanScanner:
                                 "profit_pct": round(profit_pct, 4),
                                 "confidence": round(confidence, 3),
                                 "rule_desc": f"{cat} 類別組合套利",
+                                "entry_price": round(entry_price, 4),
+                                "target_price": round(target_price, 4),
+                                "stop_loss": round(stop_loss, 4),
+                                "position_size": round(position_size, 2),
+                                "direction": "YES",
                                 "detail": (
                                     f"[多條件組合] {cat} 類別\n"
                                     f"市場1：{m1.get('title', '')[:50]} YES={yes1:.2%}\n"
                                     f"市場2：{m2.get('title', '')[:50]} YES={yes2:.2%}\n"
-                                    f"相關修正聯合機率 {correlated_joint:.2%} vs 獨立 {independent_joint:.2%}"
+                                    f"相關修正聯合機率 {correlated_joint:.2%} vs 獨立 {independent_joint:.2%}\n"
+                                    f"📈 進場：${entry_price:.3f}  🎯 目標：${target_price:.3f}  🛡 停損：${stop_loss:.3f}\n"
+                                    f"💰 建議倉位：${position_size:.0f}"
                                 ),
-                                "suggested_position": self._calc_position(avg_liquidity, confidence),
+                                "suggested_position": position_size,
                             })
 
         return signals
