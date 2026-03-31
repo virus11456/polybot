@@ -6,12 +6,13 @@ RoanScanner — 套利信號偵測引擎
 2. 多條件組合掃描：找出多個市場共同條件下的聯合套利機會
 3. 高機率市場掃描：偵測 YES/NO 機率極高的市場（直接進場）
 4. 持續掃描循環：定期從 Polymarket 拉取市場並發出信號
+5. 每小時狀態更新：無信號時也推送掃描摘要
 """
 
 import asyncio
 import logging
 import os
-from decimal import Decimal
+from datetime import datetime as _dt
 from typing import List, Optional, Dict, Tuple, Any
 
 from sqlalchemy import text
@@ -22,8 +23,6 @@ from app.data.polymarket_client import PolymarketClient
 logger = logging.getLogger(__name__)
 
 # ─── 邏輯依賴關係規則表 ─────────────────────────────────────────────────────────
-# 格式：(觸發關鍵字組, 依賴關鍵字組, 描述)
-# 若市場 A 包含觸發詞且市場 B 包含依賴詞，則 A YES => B YES（機率應更高）
 LOGIC_DEPENDENCY_RULES: List[Tuple[List[str], List[str], str]] = [
     # 天氣邏輯依賴
     (["thunderstorm", "lightning", "severe storm", "雷雨"], ["rain", "rainfall", "precipitation", "下雨"], "雷雨→降雨依賴"),
@@ -50,16 +49,19 @@ LOGIC_DEPENDENCY_RULES: List[Tuple[List[str], List[str], str]] = [
 COMBO_SCAN_CATEGORIES = ["weather", "politics", "macro", "geopolitical"]
 
 # 套利信號觸發閾值
-MIN_LIQUIDITY = 500.0        # 最低流動性（USD）— 降低門檻增加信號
-MIN_PROFIT_PCT = 0.015       # 最低套利空間 1.5%
-MIN_CONFIDENCE = 0.50        # 最低置信度
-LOGIC_ARB_THRESHOLD = 0.05   # 邏輯依賴套利價差閾值：降至 5%
-COMBO_PRICE_DIFF_THRESHOLD = 0.08  # 多條件組合套利價差閾值
+MIN_LIQUIDITY = 500.0
+MIN_PROFIT_PCT = 0.015
+MIN_CONFIDENCE = 0.50
+LOGIC_ARB_THRESHOLD = 0.05
+COMBO_PRICE_DIFF_THRESHOLD = 0.08
 
 # 高機率直接進場閾值
-HIGH_PROB_YES_THRESHOLD = 0.70  # YES > 70% 考慮 YES 直接買入
-HIGH_PROB_NO_THRESHOLD = 0.15   # YES < 15%（即 NO > 85%）考慮 NO 買入
-HIGH_PROB_MIN_LIQUIDITY = 50000  # 高機率掃描需要較高流動性
+HIGH_PROB_YES_THRESHOLD = 0.70
+HIGH_PROB_NO_THRESHOLD = 0.15
+HIGH_PROB_MIN_LIQUIDITY = 50000
+
+# 每小時狀態更新間隔（秒）
+HOURLY_STATUS_INTERVAL = 3600
 
 
 class RoanScanner:
@@ -69,20 +71,22 @@ class RoanScanner:
 
     def __init__(self):
         db_url = os.getenv("DATABASE_URL", "")
-        # 轉換 asyncpg driver
         if db_url.startswith("postgresql://"):
             db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
         elif db_url.startswith("postgres://"):
             db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
 
         self._client = PolymarketClient(db_url=db_url if db_url else None)
-        self._scan_interval = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))  # 預設 1 分鐘
+        self._scan_interval = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
 
         # 快取最新掃描到的市場列表（供 TG /marketlist 查詢）
         self._last_markets: List[dict] = []
         self._last_scan_time: Optional[str] = None
         # 已發送過的高機率市場（避免重複推送）
         self._sent_high_prob: set = set()
+        # 每小時狀態更新追蹤
+        self._last_hourly_status_time: float = 0.0
+        self._signals_since_last_hourly: int = 0
 
     async def continuous_scan(self):
         """持續掃描循環（在後台 task 中執行）。"""
@@ -107,7 +111,6 @@ class RoanScanner:
 
         # 快取最新市場供 TG 查詢
         self._last_markets = markets
-        from datetime import datetime as _dt
         self._last_scan_time = _dt.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
         # 市場資料寫入 DB（供信號 FK 使用）
@@ -139,11 +142,67 @@ class RoanScanner:
         if all_signals:
             await self._store_signals(all_signals)
 
-        # 5. 發送 Telegram 通知
+        # 5. 發送 Telegram 信號通知
         if all_signals:
             await self._send_telegram_signals(all_signals)
 
+        # 6. 累計自上次每小時更新以來的信號數
+        self._signals_since_last_hourly += len(all_signals)
+
+        # 7. 每小時推送一次狀態更新（不論有無信號）
+        import time
+        now = time.monotonic()
+        if now - self._last_hourly_status_time >= HOURLY_STATUS_INTERVAL:
+            await self._send_hourly_status(len(markets), all_signals)
+            self._last_hourly_status_time = now
+            self._signals_since_last_hourly = 0
+
         return all_signals
+
+    # ─── 每小時狀態更新 ───────────────────────────────────────────────────────
+
+    async def _send_hourly_status(self, market_count: int, latest_signals: List[dict]):
+        """每小時向 Telegram 發送掃描狀態更新（不論是否有信號）。"""
+        token = os.getenv("TELEGRAM_TOKEN")
+        chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        if not token or not chat_id:
+            return
+
+        try:
+            import app.main as _main
+            bot = _main._get_bot()
+            if bot is None:
+                return
+
+            now_str = _dt.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+            if self._signals_since_last_hourly > 0:
+                # 這小時有信號，摘要顯示
+                sig_count = self._signals_since_last_hourly
+                text = (
+                    f"⏰ <b>每小時掃描摘要</b> | {now_str}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 監控市場：{market_count:,} 個\n"
+                    f"✅ 本小時套利信號：{sig_count} 個\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🔗 <a href='https://polybot-production-7c05.up.railway.app'>Dashboard</a>"
+                )
+            else:
+                # 這小時無匹配信號
+                text = (
+                    f"⏰ <b>每小時掃描摘要</b> | {now_str}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 監控市場：{market_count:,} 個\n"
+                    f"❌ 無匹配套利項目\n"
+                    f"（持續監控中，偵測到機會立即推送）\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🔗 <a href='https://polybot-production-7c05.up.railway.app'>Dashboard</a>"
+                )
+
+            await bot.send_message(text)
+            logger.info(f"每小時狀態更新已發送（信號數：{self._signals_since_last_hourly}）")
+        except Exception as e:
+            logger.error(f"每小時狀態更新發送失敗：{e}")
 
     # ─── 高機率直接進場掃描 ──────────────────────────────────────────────────
 
@@ -168,12 +227,10 @@ class RoanScanner:
 
             title = mkt.get("title", "")[:80]
 
-            # YES > 70%: 直接買入 YES
             if yes >= HIGH_PROB_YES_THRESHOLD:
                 entry_price = yes
-                # 目標：結算時 YES = 1.0（賺取 1 - entry 每股）
-                target_price = min(0.99, yes + (1.0 - yes) * 0.5)  # 保守目標：收益一半
-                stop_loss = max(0.01, yes - (1.0 - yes) * 0.3)    # 停損：當前空間的 30%
+                target_price = min(0.99, yes + (1.0 - yes) * 0.5)
+                stop_loss = max(0.01, yes - (1.0 - yes) * 0.3)
                 profit_pct = (target_price - entry_price) / entry_price
                 confidence = min(0.90, 0.60 + (yes - 0.70) * 1.0)
                 position_size = self._calc_position(liq, confidence)
@@ -203,10 +260,9 @@ class RoanScanner:
                         "suggested_position": position_size,
                     })
 
-            # YES < 15% (NO > 85%): 買入 NO
             elif yes <= HIGH_PROB_NO_THRESHOLD:
                 no_price = 1.0 - yes
-                entry_price = no_price  # NO 進場價
+                entry_price = no_price
                 target_price = min(0.99, no_price + (1.0 - no_price) * 0.5)
                 stop_loss = max(0.01, no_price - (1.0 - no_price) * 0.3)
                 profit_pct = (target_price - entry_price) / entry_price
@@ -253,7 +309,6 @@ class RoanScanner:
         for rule in LOGIC_DEPENDENCY_RULES:
             trigger_keywords, dependent_keywords, rule_desc = rule
 
-            # 找到觸發市場與依賴市場
             trigger_markets = self._filter_markets_by_keywords(markets, trigger_keywords)
             dependent_markets = self._filter_markets_by_keywords(markets, dependent_keywords)
 
@@ -261,11 +316,11 @@ class RoanScanner:
                 t_yes = t_mkt.get("yes_price")
                 t_liquidity = t_mkt.get("liquidity", 0)
                 if t_yes is None or t_yes < 0.5 or t_liquidity < MIN_LIQUIDITY:
-                    continue  # 觸發市場 YES 不夠高，跳過
+                    continue
 
                 for d_mkt in dependent_markets:
                     if d_mkt.get("polymarket_id") == t_mkt.get("polymarket_id"):
-                        continue  # 同一市場跳過
+                        continue
 
                     d_yes = d_mkt.get("yes_price")
                     d_liquidity = d_mkt.get("liquidity", 0)
@@ -319,7 +374,6 @@ class RoanScanner:
         """
         signals = []
 
-        # 按類別分組
         by_category: Dict[str, List[dict]] = {}
         for mkt in markets:
             cat = mkt.get("category", "other")
@@ -336,10 +390,8 @@ class RoanScanner:
             if len(cat_markets) < 2:
                 continue
 
-            # 找出 YES 最高的前 10 個市場
             top = sorted(cat_markets, key=lambda m: m.get("yes_price", 0), reverse=True)[:10]
 
-            # 掃描兩兩組合
             for i in range(len(top)):
                 for j in range(i + 1, len(top)):
                     m1, m2 = top[i], top[j]
@@ -437,7 +489,7 @@ class RoanScanner:
 
     def _calc_position(self, liquidity: float, confidence: float) -> float:
         """計算建議倉位（流動性的一定比例，依置信度縮放）。"""
-        base = min(liquidity * 0.01, 500.0)  # 最多流動性 1%，上限 500 USD
+        base = min(liquidity * 0.01, 500.0)
         return round(base * confidence, 2)
 
     async def _store_signals(self, signals: List[dict]):
@@ -481,7 +533,6 @@ class RoanScanner:
             return
 
         try:
-            # 重用 main.py 的 singleton bot，避免每次建立新 session 造成資源洩漏
             import app.main as _main
             bot = _main._get_bot()
             if bot is None:
