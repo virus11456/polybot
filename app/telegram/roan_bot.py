@@ -2,7 +2,7 @@
 RoanTelegramBot — Telegram 機器人
 
 功能：
-1. 發送套利信號通知
+1. 發送套利信號通知（含進出場價格與信心度）
 2. Bot UI 市場選擇（用戶可選擇關注類別/市場）
 3. 每日報告發送
 4. 查詢信號與績效
@@ -119,16 +119,17 @@ class RoanTelegramBot:
 
     async def send_signal(self, signal: dict) -> Optional[dict]:
         """
-        發送套利信號訊息。
-        僅發送給已訂閱對應類別的用戶。
+        發送套利信號訊息（含進出場價格、信心度等級）。
+        訂閱特定類別時只發該類別；若 category 為 'other' 則仍發送（不過濾）。
         """
         signal_type = signal.get("signal_type", "")
         target_market = signal.get("target_market", {})
+        trigger_market = signal.get("trigger_market", {})
         category = target_market.get("category", "other")
 
-        # 檢查訂閱
-        subscribed_cats = self._subscriptions.get(self.chat_id, [])
-        if category not in subscribed_cats:
+        # 只有明確分類且用戶選擇了特定訂閱時才過濾；"other" 不過濾
+        subscribed_cats = self._subscriptions.get(self.chat_id, list(AVAILABLE_CATEGORIES.keys()))
+        if category != "other" and category not in subscribed_cats:
             logger.debug(f"Chat {self.chat_id} 未訂閱 {category}，跳過信號")
             return None
 
@@ -138,18 +139,47 @@ class RoanTelegramBot:
         profit_pct = signal.get("profit_pct", 0)
         confidence = signal.get("confidence", 0)
         suggested_position = signal.get("suggested_position", 0)
-        detail = signal.get("detail", "")
         rule_desc = signal.get("rule_desc", "")
+
+        # 進出場資訊
+        target_yes = target_market.get("yes_price")
+        trigger_yes = trigger_market.get("yes_price")
+        entry_price = target_yes  # 進場：買入目標市場 YES
+        # 出場目標：目標市場 YES 漲至觸發市場水準的 85%（邏輯依賴閾值）
+        exit_target = trigger_yes * 0.85 if trigger_yes else (
+            (entry_price + profit_pct) if entry_price is not None else None
+        )
+
+        target_title = (target_market.get("title") or "")[:60]
+        trigger_title = (trigger_market.get("title") or "")[:60]
+
+        entry_str = f"{entry_price:.2%}" if entry_price is not None else "N/A"
+        exit_str = f"{exit_target:.2%}" if exit_target is not None else "N/A"
+
+        # 信心等級標示
+        if confidence >= 0.80:
+            confidence_label = "🟢 高"
+        elif confidence >= 0.65:
+            confidence_label = "🟡 中"
+        else:
+            confidence_label = "🔴 低"
+
+        cat_label = AVAILABLE_CATEGORIES.get(category, category)
 
         text = (
             f"{emoji} <b>{type_label}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📌 規則：{rule_desc}\n"
+            f"🏷 類別：{cat_label}\n"
+            f"🎯 信心度：{confidence_label}（{confidence:.1%}）\n"
             f"💹 預期獲利：{profit_pct:.2%}\n"
-            f"🎯 置信度：{confidence:.1%}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📥 <b>進場</b>：買入 YES @ {entry_str}\n"
+            f"📤 <b>出場目標</b>：YES 漲至 {exit_str}\n"
             f"💵 建議倉位：${suggested_position:.2f}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<pre>{detail[:300]}</pre>"
+            f"🔔 目標市場：{target_title}\n"
+            f"⚡ 觸發市場：{trigger_title}\n"
         )
 
         return await self.send_message(text)
@@ -263,7 +293,8 @@ class RoanTelegramBot:
                 # 取今日信號數量（按類型分組）
                 sig_result = await session.execute(
                     text("""
-                        SELECT signal_type, COUNT(*) as cnt, AVG(profit_pct) as avg_profit
+                        SELECT signal_type, COUNT(*) as cnt, AVG(profit_pct) as avg_profit,
+                               AVG(confidence) as avg_confidence
                         FROM roan_signals
                         WHERE DATE(created_at) = :d
                         GROUP BY signal_type
@@ -299,7 +330,12 @@ class RoanTelegramBot:
             sig_text = "\n🔍 信號分布：\n"
             for row in sig_rows:
                 type_label = "邏輯依賴" if row["signal_type"] == "logic_arb" else "多條件組合"
-                sig_text += f"• {type_label}：{row['cnt']} 個，平均獲利 {float(row['avg_profit'] or 0):.2%}\n"
+                avg_conf = float(row["avg_confidence"] or 0)
+                sig_text += (
+                    f"• {type_label}：{row['cnt']} 個，"
+                    f"平均獲利 {float(row['avg_profit'] or 0):.2%}，"
+                    f"平均信心 {avg_conf:.1%}\n"
+                )
         else:
             sig_text = "\n🔍 今日無套利信號偵測。\n"
 
@@ -377,6 +413,57 @@ class RoanTelegramBot:
         for i in range(0, len(full_text), chunk_size):
             await self.send_message(full_text[i:i + chunk_size], chat_id=target)
 
+    # ─── 最新信號查詢 ────────────────────────────────────────────────────────
+
+    async def send_recent_signals(self, chat_id: Optional[str] = None, limit: int = 5) -> None:
+        """查詢並發送最近的套利信號（/signals 指令）。"""
+        target = chat_id or self.chat_id
+        try:
+            from app.database import AsyncSessionLocal
+            from sqlalchemy import text
+
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    text("""
+                        SELECT rs.signal_type, rs.profit_pct, rs.confidence,
+                               rs.suggested_position, rs.status, rs.created_at,
+                               m.title as market_title, m.category
+                        FROM roan_signals rs
+                        LEFT JOIN markets m ON m.id = rs.market_id
+                        ORDER BY rs.created_at DESC
+                        LIMIT :limit
+                    """),
+                    {"limit": limit}
+                )
+                rows = result.mappings().all()
+        except Exception as e:
+            await self.send_message(f"⚠️ 無法取得信號：{e}", chat_id=target)
+            return
+
+        if not rows:
+            await self.send_message("📭 目前尚無套利信號紀錄。", chat_id=target)
+            return
+
+        lines = [f"📋 <b>最新 {limit} 筆套利信號</b>", "━━━━━━━━━━━━━━━━━━━━"]
+        for row in rows:
+            sig_type = "邏輯依賴" if row["signal_type"] == "logic_arb" else "多條件組合"
+            conf = float(row["confidence"] or 0)
+            if conf >= 0.80:
+                conf_label = "🟢"
+            elif conf >= 0.65:
+                conf_label = "🟡"
+            else:
+                conf_label = "🔴"
+            created = str(row["created_at"])[:16]
+            lines.append(
+                f"\n{conf_label} [{created}] {sig_type}\n"
+                f"  市場：{(row['market_title'] or 'N/A')[:50]}\n"
+                f"  信心度：{conf:.1%}  預期獲利：{float(row['profit_pct'] or 0):.2%}\n"
+                f"  建議倉位：${float(row['suggested_position'] or 0):.2f}  狀態：{row['status']}"
+            )
+
+        await self.send_message("\n".join(lines), chat_id=target)
+
     # ─── 指令處理 ─────────────────────────────────────────────────────────────
 
     async def handle_update(self, update: dict) -> None:
@@ -415,6 +502,9 @@ class RoanTelegramBot:
         elif text.startswith("/markets"):
             await self.send_category_selector(chat_id=chat_id)
 
+        elif text.startswith("/signals"):
+            await self.send_recent_signals(chat_id=chat_id)
+
         elif text.startswith("/report"):
             await self.send_daily_report()
 
@@ -429,7 +519,10 @@ class RoanTelegramBot:
                 "📋 <b>指令：</b>\n"
                 "/marketlist — 列出目前鎖定掃描中的所有市場（按類別）\n"
                 "/markets — 按類別篩選要接收的通知\n"
+                "/signals — 查看最新 5 筆套利信號（含進出場價格）\n"
                 "/report — 查看今日績效報告\n\n"
+                "📊 <b>信號說明：</b>\n"
+                "🟢 高信心（≥80%）  🟡 中信心（65-80%）  🔴 低信心（<65%）\n\n"
                 "掃描頻率：每 60 秒一次（可透過 SCAN_INTERVAL_SECONDS 環境變數調整）",
                 chat_id=chat_id
             )
