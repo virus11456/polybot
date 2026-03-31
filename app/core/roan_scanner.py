@@ -110,6 +110,14 @@ class RoanScanner:
         from datetime import datetime as _dt
         self._last_scan_time = _dt.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
+        # 市場資料寫入 DB（供信號 FK 使用）
+        if markets:
+            try:
+                await self._client.upsert_markets(markets)
+                logger.info(f"Upserted {len(markets)} markets to DB")
+            except Exception as e:
+                logger.warning(f"Market upsert failed (signals may not store): {e}")
+
         all_signals = []
 
         # 1. 高機率直接進場掃描（最優先）
@@ -433,11 +441,13 @@ class RoanScanner:
         return round(base * confidence, 2)
 
     async def _store_signals(self, signals: List[dict]):
-        """將信號儲存至 roan_signals 表。"""
+        """將信號儲存至 roan_signals 表（含進出場價格與方向）。"""
         insert_sql = text("""
             INSERT INTO roan_signals
-                (market_id, signal_type, profit_pct, confidence, suggested_position, status)
-            SELECT m.id, :signal_type, :profit_pct, :confidence, :suggested_position, 'pending'
+                (market_id, signal_type, profit_pct, confidence, suggested_position,
+                 entry_price, target_price, stop_loss, direction, status)
+            SELECT m.id, :signal_type, :profit_pct, :confidence, :suggested_position,
+                   :entry_price, :target_price, :stop_loss, :direction, 'pending'
             FROM markets m
             WHERE m.polymarket_id = :polymarket_id
             LIMIT 1
@@ -454,6 +464,10 @@ class RoanScanner:
                             "profit_pct": sig["profit_pct"],
                             "confidence": sig["confidence"],
                             "suggested_position": sig["suggested_position"],
+                            "entry_price": sig.get("entry_price"),
+                            "target_price": sig.get("target_price"),
+                            "stop_loss": sig.get("stop_loss"),
+                            "direction": sig.get("direction", "YES"),
                         })
             logger.info(f"儲存 {len(signals)} 個信號")
         except Exception as e:
