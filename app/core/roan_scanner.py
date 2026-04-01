@@ -141,11 +141,11 @@ class RoanScanner:
         all_signals.extend(combo_signals)
         logger.info(f"多條件組合：偵測到 {len(combo_signals)} 個信號")
 
-        # 4. 儲存信號至 DB
+        # 4. 儲存信號至 DB（自動偵測 schema 版本）
         if all_signals:
             await self._store_signals(all_signals)
 
-        # 5. 發送 Telegram 信號通知
+        # 5. 發送 Telegram 信號通知（無論儲存是否成功，確保推播）
         if all_signals:
             await self._send_telegram_signals(all_signals)
 
@@ -166,7 +166,6 @@ class RoanScanner:
 
     async def _send_hourly_status(self, market_count: int, latest_signals: List[dict]):
         """每小時向 Telegram 發送掃描狀態更新（不論是否有信號）。"""
-        # 讀取 APP_URL 環境變數，支援自訂域名（如 polyboy.tech）
         app_url = os.getenv("APP_URL", _APP_URL)
         token = os.getenv("TELEGRAM_TOKEN")
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -497,8 +496,12 @@ class RoanScanner:
         return round(base * confidence, 2)
 
     async def _store_signals(self, signals: List[dict]):
-        """將信號儲存至 roan_signals 表（含進出場價格與方向）。"""
-        insert_sql = text("""
+        """
+        將信號儲存至 roan_signals 表。
+        先嘗試含新欄位（entry_price 等）的 INSERT；
+        若 DB schema 尚未遷移（舊版），則退回基本欄位 INSERT。
+        """
+        insert_full = text("""
             INSERT INTO roan_signals
                 (market_id, signal_type, profit_pct, confidence, suggested_position,
                  entry_price, target_price, stop_loss, direction, status)
@@ -509,13 +512,26 @@ class RoanScanner:
             LIMIT 1
         """)
 
+        insert_basic = text("""
+            INSERT INTO roan_signals
+                (market_id, signal_type, profit_pct, confidence, suggested_position, status)
+            SELECT m.id, :signal_type, :profit_pct, :confidence, :suggested_position, 'pending'
+            FROM markets m
+            WHERE m.polymarket_id = :polymarket_id
+            LIMIT 1
+        """)
+
+        stored = 0
         try:
             async with AsyncSessionLocal() as session:
                 async with session.begin():
                     for sig in signals:
                         target = sig.get("target_market", {})
-                        await session.execute(insert_sql, {
-                            "polymarket_id": target.get("polymarket_id", ""),
+                        pid = target.get("polymarket_id", "")
+                        if not pid:
+                            continue
+                        params_full = {
+                            "polymarket_id": pid,
                             "signal_type": sig["signal_type"],
                             "profit_pct": sig["profit_pct"],
                             "confidence": sig["confidence"],
@@ -524,10 +540,32 @@ class RoanScanner:
                             "target_price": sig.get("target_price"),
                             "stop_loss": sig.get("stop_loss"),
                             "direction": sig.get("direction", "YES"),
-                        })
-            logger.info(f"儲存 {len(signals)} 個信號")
+                        }
+                        await session.execute(insert_full, params_full)
+                        stored += 1
+            logger.info(f"儲存 {stored} 個信號（含進出場欄位）")
         except Exception as e:
-            logger.error(f"儲存信號失敗：{e}")
+            # 退回基本欄位（schema 尚未遷移）
+            logger.warning(f"Full-schema insert failed ({e}), falling back to basic insert")
+            try:
+                async with AsyncSessionLocal() as session:
+                    async with session.begin():
+                        for sig in signals:
+                            target = sig.get("target_market", {})
+                            pid = target.get("polymarket_id", "")
+                            if not pid:
+                                continue
+                            await session.execute(insert_basic, {
+                                "polymarket_id": pid,
+                                "signal_type": sig["signal_type"],
+                                "profit_pct": sig["profit_pct"],
+                                "confidence": sig["confidence"],
+                                "suggested_position": sig["suggested_position"],
+                            })
+                            stored += 1
+                logger.info(f"儲存 {stored} 個信號（基本欄位 fallback）")
+            except Exception as e2:
+                logger.error(f"基本欄位 insert 也失敗：{e2}")
 
     async def _send_telegram_signals(self, signals: List[dict]):
         """發送 Telegram 通知（透過 RoanTelegramBot singleton）。"""

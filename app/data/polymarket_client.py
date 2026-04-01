@@ -205,6 +205,7 @@ class PolymarketClient:
     async def upsert_markets(self, markets: List[dict]) -> int:
         """
         Upsert markets into the `markets` table using polymarket_id.
+        Tries with slug column first; falls back to without slug if migration not yet run.
         Returns count of upserted rows.
         """
         if not self._async_session:
@@ -213,7 +214,7 @@ class PolymarketClient:
         if not markets:
             return 0
 
-        upsert_sql = text("""
+        upsert_with_slug = text("""
             INSERT INTO markets (
                 polymarket_id, category, title, slug,
                 yes_price, no_price, liquidity, end_timestamp, rules, updated_at
@@ -233,24 +234,62 @@ class PolymarketClient:
                 updated_at = NOW()
         """)
 
+        upsert_no_slug = text("""
+            INSERT INTO markets (
+                polymarket_id, category, title,
+                yes_price, no_price, liquidity, end_timestamp, rules, updated_at
+            ) VALUES (
+                :polymarket_id, :category, :title,
+                :yes_price, :no_price, :liquidity, :end_timestamp, :rules, NOW()
+            )
+            ON CONFLICT (polymarket_id) DO UPDATE SET
+                category = EXCLUDED.category,
+                title = EXCLUDED.title,
+                yes_price = EXCLUDED.yes_price,
+                no_price = EXCLUDED.no_price,
+                liquidity = EXCLUDED.liquidity,
+                end_timestamp = EXCLUDED.end_timestamp,
+                rules = EXCLUDED.rules,
+                updated_at = NOW()
+        """)
+
+        def _params(market, with_slug=True):
+            p = {
+                "polymarket_id": market.get("polymarket_id"),
+                "category": market.get("category", "other"),
+                "title": market.get("title"),
+                "yes_price": market.get("yes_price"),
+                "no_price": market.get("no_price"),
+                "liquidity": market.get("liquidity", 0),
+                "end_timestamp": market.get("end_timestamp"),
+                "rules": market.get("rules"),
+            }
+            if with_slug:
+                p["slug"] = market.get("slug", "")
+            return p
+
+        # Try with slug first
+        try:
+            count = 0
+            async with self._async_session() as session:
+                async with session.begin():
+                    for market in markets:
+                        await session.execute(upsert_with_slug, _params(market, True))
+                        count += 1
+            logger.info(f"Upserted {count} markets to database (with slug)")
+            return count
+        except Exception as e:
+            logger.warning(f"Slug upsert failed ({e}), falling back to no-slug upsert")
+
+        # Fallback: without slug
         count = 0
         async with self._async_session() as session:
             async with session.begin():
                 for market in markets:
-                    await session.execute(upsert_sql, {
-                        "polymarket_id": market.get("polymarket_id"),
-                        "category": market.get("category", "other"),
-                        "title": market.get("title"),
-                        "slug": market.get("slug", ""),
-                        "yes_price": market.get("yes_price"),
-                        "no_price": market.get("no_price"),
-                        "liquidity": market.get("liquidity", 0),
-                        "end_timestamp": market.get("end_timestamp"),
-                        "rules": market.get("rules"),
-                    })
+                    await session.execute(upsert_no_slug, _params(market, False))
                     count += 1
 
-        logger.info(f"Upserted {count} markets to database")
+        logger.info(f"Upserted {count} markets to database (no-slug fallback)")
         return count
 
     async def fetch_and_store(self) -> List[dict]:
