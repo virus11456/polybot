@@ -22,6 +22,9 @@ from app.data.polymarket_client import PolymarketClient
 
 logger = logging.getLogger(__name__)
 
+# Dashboard URL — configurable via APP_URL env var (set to custom domain when available)
+_APP_URL = os.getenv("APP_URL", "https://polybot-production-7c05.up.railway.app")
+
 # ─── 邏輯依賴關係規則表 ─────────────────────────────────────────────────────────
 LOGIC_DEPENDENCY_RULES: List[Tuple[List[str], List[str], str]] = [
     # 天氣邏輯依賴
@@ -163,6 +166,8 @@ class RoanScanner:
 
     async def _send_hourly_status(self, market_count: int, latest_signals: List[dict]):
         """每小時向 Telegram 發送掃描狀態更新（不論是否有信號）。"""
+        # 讀取 APP_URL 環境變數，支援自訂域名（如 polyboy.tech）
+        app_url = os.getenv("APP_URL", _APP_URL)
         token = os.getenv("TELEGRAM_TOKEN")
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
         if not token or not chat_id:
@@ -184,7 +189,7 @@ class RoanScanner:
                     f"📊 監控市場：{market_count:,} 個\n"
                     f"✅ 本小時套利信號：{sig_count} 個\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🔗 <a href='https://polybot-production-7c05.up.railway.app'>Dashboard</a>"
+                    f"🔗 <a href='{app_url}'>Dashboard</a>"
                 )
             else:
                 text = (
@@ -194,7 +199,7 @@ class RoanScanner:
                     f"❌ 無匹配套利項目\n"
                     f"（持續監控中，偵測到機會立即推送）\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🔗 <a href='https://polybot-production-7c05.up.railway.app'>Dashboard</a>"
+                    f"🔗 <a href='{app_url}'>Dashboard</a>"
                 )
 
             await bot.send_message(text)
