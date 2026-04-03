@@ -364,7 +364,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <script>
 const BASE = '';
-const POLY_BASE = 'https://polymarket.com/event/';
+const POLY_BASE = 'https://polymarket.com/market/';
 const TYPE_MAP = {
   logic_arb: ['🔵', '邏輯依賴', 'badge-logic'],
   combo_arb: ['🟣', '多條件組合', 'badge-combo'],
